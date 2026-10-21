@@ -7,8 +7,8 @@ class CSRFMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
         # Only protect mutating methods
         if request.method in ["POST", "PUT", "DELETE", "PATCH"]:
-            # If the request has an X-API-Key, it's a hardware client, skip CSRF
-            if "X-API-Key" in request.headers:
+            # If the request has an X-API-Key or Authorization header or is high-frequency ANPR frame detection
+            if "X-API-Key" in request.headers or "Authorization" in request.headers or request.url.path.startswith("/api/anpr/detect-frame"):
                 return await call_next(request)
 
             # Get tokens
