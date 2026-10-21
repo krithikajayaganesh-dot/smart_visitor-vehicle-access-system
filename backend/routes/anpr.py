@@ -18,7 +18,7 @@ from routes.qr import generate_qr_code_file
 
 router = APIRouter(prefix="/api/anpr", tags=["ANPR"])
 
-SAMPLE_IMAGES_DIR = BASE_DIR.parent / "temp" / "Indian-Number-Plate-Recognition-master" / "inputs"
+SAMPLE_IMAGES_DIR = BASE_DIR / "temp" / "Indian-Number-Plate-Recognition-master" / "inputs"
 
 # ─── Pydantic Schemas ───
 class FrameDetectRequest(BaseModel):
@@ -62,6 +62,74 @@ def get_anpr_status():
         "fallback": "Contour Edge Analysis"
     }
 
+def _hamming(a: str, b: str) -> int:
+    return sum(x != y for x, y in zip(a, b))
+
+
+def match_pass_for_plate(db: Session, plate: str):
+    """
+    Find the visitor pass for a plate. Returns (pass_data | None, recommendation, match_type).
+    match_type is "exact", or "near" when the plate differs by one character
+    (a likely OCR slip), in which case the guard must verify by eye.
+    """
+    norm_plate = normalize_plate(plate)
+    if not norm_plate:
+        return None, "none", None
+
+    recent = (
+        db.query(VisitorPass)
+        .filter(VisitorPass.vehicle_number.isnot(None))
+        .order_by(VisitorPass.created_at.desc())
+        .limit(100)
+        .all()
+    )
+
+    matched, match_type = None, None
+    for p in recent:
+        if normalize_plate(p.vehicle_number) == norm_plate:
+            matched, match_type = p, "exact"
+            break
+    if matched is None:
+        near = [
+            p for p in recent
+            if len(normalize_plate(p.vehicle_number)) == len(norm_plate)
+            and _hamming(normalize_plate(p.vehicle_number), norm_plate) == 1
+        ]
+        distinct = {normalize_plate(p.vehicle_number) for p in near}
+        if len(distinct) == 1:  # only trust it when it is unambiguous
+            matched, match_type = near[0], "near"
+
+    if matched is None:
+        return None, "unregistered", None
+
+    if datetime.utcnow() > matched.expires_at:
+        status_str, rec = "expired", "expired"
+    else:
+        status_str = matched.status.value if hasattr(matched.status, "value") else str(matched.status)
+        if status_str in ["not_inside", "approved", "pending"]:
+            rec = "entry"
+        elif status_str in ["in_campus", "used"]:
+            rec = "exit"
+        elif status_str == "exited":
+            rec = "already_exited"
+        else:
+            rec = "unknown"
+
+    data = {
+        "id": matched.id,
+        "visitor_name": matched.visitor_name,
+        "vehicle_number": matched.vehicle_number,
+        "purpose": matched.purpose,
+        "status": status_str,
+        "host_flat": matched.resident.flat_number if matched.resident else "—",
+        "host_name": matched.resident.full_name if matched.resident else "Host Resident",
+        "expires_at": matched.expires_at.isoformat(),
+        "qr_token": matched.qr_token,
+        "match_type": match_type,
+    }
+    return data, rec, match_type
+
+
 @router.post("/detect-frame")
 def detect_frame(
     payload: FrameDetectRequest,
@@ -76,65 +144,11 @@ def detect_frame(
     if img is None:
         raise HTTPException(status_code=400, detail="Invalid image frame encoding")
 
-    svc = get_anpr_service()
-    detection = svc.detect_plate(img)
+    detection = get_anpr_service().detect_plate(img)
 
-    matched_pass_data = None
-    recommendation = "none"
-
+    matched_pass_data, recommendation = None, "none"
     if detection["detected"]:
-        raw_plate = detection["plate_number"]
-        norm_plate = normalize_plate(raw_plate)
-
-        # Search for active/recent visitor passes matching this vehicle plate
-        all_recent_passes = (
-            db.query(VisitorPass)
-            .filter(VisitorPass.vehicle_number.isnot(None))
-            .order_by(VisitorPass.created_at.desc())
-            .limit(100)
-            .all()
-        )
-
-        matched_pass = None
-        for p in all_recent_passes:
-            if normalize_plate(p.vehicle_number) == norm_plate:
-                matched_pass = p
-                break
-
-        if matched_pass:
-            # Check expiry
-            is_expired = datetime.utcnow() > matched_pass.expires_at
-            if is_expired:
-                status_str = "expired"
-                rec = "expired"
-            else:
-                status_str = matched_pass.status.value if hasattr(matched_pass.status, 'value') else str(matched_pass.status)
-                if status_str in ["not_inside", "approved", "pending"]:
-                    rec = "entry"
-                elif status_str in ["in_campus", "used"]:
-                    rec = "exit"
-                elif status_str == "exited":
-                    rec = "already_exited"
-                else:
-                    rec = "unknown"
-
-            host_flat = matched_pass.resident.flat_number if matched_pass.resident else "—"
-            host_name = matched_pass.resident.full_name if matched_pass.resident else "Host Resident"
-
-            matched_pass_data = {
-                "id": matched_pass.id,
-                "visitor_name": matched_pass.visitor_name,
-                "vehicle_number": matched_pass.vehicle_number,
-                "purpose": matched_pass.purpose,
-                "status": status_str,
-                "host_flat": host_flat,
-                "host_name": host_name,
-                "expires_at": matched_pass.expires_at.isoformat(),
-                "qr_token": matched_pass.qr_token,
-            }
-            recommendation = rec
-        else:
-            recommendation = "unregistered"
+        matched_pass_data, recommendation, _ = match_pass_for_plate(db, detection["plate_number"])
 
     return {
         "success": True,
@@ -142,6 +156,17 @@ def detect_frame(
         "matched_pass": matched_pass_data,
         "recommendation": recommendation,
     }
+
+
+@router.get("/lookup")
+def lookup_plate(
+    plate: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_role("guard", "admin")),
+):
+    """Look up a (manually corrected) plate number against visitor passes."""
+    data, rec, match_type = match_pass_for_plate(db, plate)
+    return {"matched_pass": data, "recommendation": rec, "match_type": match_type}
 
 @router.post("/quick-log")
 def quick_log_access(

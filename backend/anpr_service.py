@@ -6,6 +6,7 @@ import time
 import torch
 import base64
 import logging
+from collections import Counter, defaultdict
 import numpy as np
 from pathlib import Path
 from typing import Optional, Dict, Any, Tuple, List
@@ -53,6 +54,89 @@ def clean_plate_text(raw_text: str) -> str:
         cleaned = "".join(prefix) + cleaned[2:]
         
     return cleaned
+
+
+# ─── Indian plate format helpers ───
+PLATE_RE = re.compile(r"^[A-Z]{2}\d{1,2}[A-Z]{1,3}\d{4}$")
+DIGIT_TO_LETTER = {"0": "O", "1": "I", "2": "Z", "4": "A", "5": "S", "6": "G", "8": "B"}
+LETTER_TO_DIGIT = {"O": "0", "Q": "0", "D": "0", "I": "1", "L": "1", "Z": "2", "A": "4", "S": "5", "G": "6", "B": "8", "T": "7"}
+
+
+def is_valid_plate(text: str) -> bool:
+    """True if text looks like a real Indian plate, e.g. TN43F6967."""
+    return bool(PLATE_RE.match(text or "")) and text[:2] in INDIAN_STATE_CODES
+
+
+def fix_indian_plate(text: str) -> str:
+    """
+    Use the plate layout  SS DD [A-Z]{1,3} DDDD  to repair look-alike characters
+    (O/0, I/1, S/5, B/8 ...). Picks the layout that needs the fewest changes.
+    Returns the input unchanged when no layout fits well enough.
+    """
+    t = re.sub(r"[^A-Z0-9]", "", (text or "").upper())
+    n = len(t)
+    if n < 8 or n > 11:
+        return t
+    best, best_cost = None, 99
+    for d in (1, 2):  # digits in the district number
+        s = n - 6 - d  # letters in the series
+        if s < 1 or s > 3:
+            continue
+        kinds = "L" * 2 + "D" * d + "L" * s + "D" * 4
+        out, cost = [], 0
+        for ch, k in zip(t, kinds):
+            if k == "L":
+                if ch.isalpha():
+                    out.append(ch)
+                elif ch in DIGIT_TO_LETTER:
+                    out.append(DIGIT_TO_LETTER[ch]); cost += 1
+                else:
+                    out.append(ch); cost += 3
+            else:
+                if ch.isdigit():
+                    out.append(ch)
+                elif ch in LETTER_TO_DIGIT:
+                    out.append(LETTER_TO_DIGIT[ch]); cost += 1
+                else:
+                    out.append(ch); cost += 3
+        cand = "".join(out)
+        if cand[:2] not in INDIAN_STATE_CODES:
+            # try to repair the state code by changing a single letter
+            fixes = [c for c in INDIAN_STATE_CODES
+                     if sum(a != b for a, b in zip(c, cand[:2])) == 1]
+            if len(fixes) == 1:
+                cand = fixes[0] + cand[2:]; cost += 1
+            else:
+                cost += 2
+        if cost < best_cost:
+            best, best_cost = cand, cost
+    return best if best is not None and best_cost <= 4 and is_valid_plate(best) else t
+
+
+def vote_plates(cands):
+    """
+    cands: list of (text, confidence). Votes character-by-character across
+    candidates of the most common length (valid-format candidates preferred).
+    Returns (text, confidence 0..1).
+    """
+    cands = [(t, c) for t, c in cands if t]
+    if not cands:
+        return "", 0.0
+    valid = [(t, c) for t, c in cands if is_valid_plate(t)]
+    pool = valid if valid else cands
+    length = Counter(len(t) for t, _ in pool).most_common(1)[0][0]
+    pool = [(t, c) for t, c in pool if len(t) == length]
+    out, shares = [], []
+    for i in range(length):
+        score = defaultdict(float)
+        for t, c in pool:
+            score[t[i]] += max(c, 0.05)
+        best = max(score, key=score.get)
+        out.append(best)
+        shares.append(score[best] / sum(score.values()))
+    mean_conf = sum(c for _, c in pool) / len(pool)
+    return "".join(out), round(mean_conf * (sum(shares) / len(shares)), 3)
+
 
 class ANPRService:
     _instance = None
@@ -149,6 +233,49 @@ class ANPRService:
 
         return results
 
+    def crop_variants(self, img: np.ndarray, box) -> List[np.ndarray]:
+        """Several slightly different crops/contrast versions of one plate."""
+        h, w = img.shape[:2]
+        x1, y1, x2, y2 = box
+        bw, bh = x2 - x1, y2 - y1
+        out = []
+        for pad in (0.0, 0.05, 0.10):
+            px, py = int(bw * pad), int(bh * pad)
+            c = img[max(0, y1 - py):min(h, y2 + py), max(0, x1 - px):min(w, x2 + px)]
+            if c.size == 0:
+                continue
+            out.append(c)
+            try:  # contrast-enhanced copy (helps in dim light)
+                lab = cv2.cvtColor(c, cv2.COLOR_BGR2LAB)
+                l, a, b = cv2.split(lab)
+                l = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(4, 4)).apply(l)
+                out.append(cv2.cvtColor(cv2.merge((l, a, b)), cv2.COLOR_LAB2BGR))
+            except Exception:
+                pass
+            if pad == 0.05:
+                try:  # sharpened copy
+                    blur = cv2.GaussianBlur(c, (0, 0), 1.5)
+                    out.append(cv2.addWeighted(c, 1.6, blur, -0.6, 0))
+                except Exception:
+                    pass
+        return out
+
+    def read_plate(self, img: np.ndarray, box) -> Tuple[str, float, List[str]]:
+        """Run LPRNet on every variant, repair with the plate layout, then vote."""
+        variants = self.crop_variants(img, box)
+        if not variants:
+            return "", 0.0, []
+        batch = []
+        for v in variants:
+            im = cv2.resize(v, (94, 24)).astype("float32")
+            im = (im - 127.5) * 0.0078125
+            batch.append(torch.from_numpy(im.transpose((2, 0, 1))))
+        decoded = self.decode_lprnet(torch.stack(batch, 0).to(self.device))
+        cands = [(fix_indian_plate(t), c) for t, c in decoded]
+        text, conf = vote_plates(cands)
+        ranked = [t for t, _ in Counter(t for t, _ in cands).most_common(3)]
+        return text, conf, ranked
+
     def detect_contours(self, img: np.ndarray) -> Optional[Tuple[int, int, int, int]]:
         """Fast geometric edge & contour plate localization fallback."""
         try:
@@ -187,6 +314,8 @@ class ANPRService:
             "confidence": 0.0,
             "bbox": None,
             "crop_base64": None,
+            "valid_format": False,
+            "candidates": [],
             "inference_time_ms": 0.0,
             "method": "none"
         }
@@ -206,9 +335,11 @@ class ANPRService:
                     out = self.fcos_model(img_tensor)
                     # out[2][0] contains detected bounding boxes
                     raw_boxes = out[2][0].cpu().numpy().tolist()
+                    raw_scores = out[0][0].cpu().numpy().tolist()
+                    order = sorted(range(len(raw_boxes)), key=lambda i: -raw_scores[i]) if len(raw_scores) == len(raw_boxes) else range(len(raw_boxes))
                     boxes = [
-                        [int(b[0]), int(b[1]), int(b[2]), int(b[3])]
-                        for b in raw_boxes
+                        [int(raw_boxes[i][0]), int(raw_boxes[i][1]), int(raw_boxes[i][2]), int(raw_boxes[i][3])]
+                        for i in order
                     ]
             except Exception as e:
                 logger.error(f"FCOS inference error: {e}")
@@ -244,14 +375,10 @@ class ANPRService:
         plate_text = ""
         confidence = 0.0
 
+        candidates: List[str] = []
         if self.initialized and self.lprnet_model is not None:
             try:
-                im_lpr = cv2.resize(crop, (94, 24)).astype("float32")
-                im_lpr = (im_lpr - 127.5) * 0.0078125
-                im_lpr = torch.from_numpy(im_lpr.transpose((2, 0, 1))).unsqueeze(0).to(self.device)
-                decoded_plates = self.decode_lprnet(im_lpr)
-                if decoded_plates:
-                    plate_text, confidence = decoded_plates[0]
+                plate_text, confidence, candidates = self.read_plate(img, b)
             except Exception as e:
                 logger.error(f"LPRNet inference error: {e}")
 
@@ -276,6 +403,8 @@ class ANPRService:
                     "img_height": int(h_orig)
                 },
                 "crop_base64": crop_b64,
+                "valid_format": is_valid_plate(plate_text),
+                "candidates": candidates,
                 "method": method
             })
 

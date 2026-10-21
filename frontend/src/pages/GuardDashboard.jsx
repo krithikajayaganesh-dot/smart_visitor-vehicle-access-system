@@ -4,6 +4,7 @@ import API from "../api";
 import Navbar from "../components/Navbar";
 import Toast from "../components/Toast";
 import CampusSketchBG from "../components/CampusSketchBG";
+import LiveANPR from "../components/LiveANPR";
 import { formatDateTime, formatTimeOnly } from "../utils/datetime";
 import { exportToCSV } from "../utils/exportCsv";
 import {
@@ -470,6 +471,13 @@ export default function GuardDashboard() {
             <CameraIcon size={16} /> Gate Scanner & Manual Entry
           </button>
           <button
+            className={`tab ${activeTab === "anpr" ? "active" : ""}`}
+            onClick={() => { if (scanning) stopScanner(); setError(""); setActiveTab("anpr"); }}
+            style={{ display: "flex", alignItems: "center", gap: "6px" }}
+          >
+            <CameraIcon size={16} /> Live Plate Recognition
+          </button>
+          <button
             className={`tab ${activeTab === "passes" ? "active" : ""}`}
             onClick={() => setActiveTab("passes")}
             style={{ display: "flex", alignItems: "center", gap: "6px" }}
@@ -484,6 +492,16 @@ export default function GuardDashboard() {
             <LogsIcon size={16} /> Entry / Exit Logs ({filteredLogs.length})
           </button>
         </div>
+
+        {/* Live ANPR camera tab */}
+        {activeTab === "anpr" && (
+          <LiveANPR
+            onLogged={(msg) => {
+              setToast({ message: msg, type: "success" });
+              fetchTodayData();
+            }}
+          />
+        )}
 
         {/* Tab 1: Gate Scanner & Manual Entry */}
         {activeTab === "scanner" && (
