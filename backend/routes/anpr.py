@@ -18,7 +18,7 @@ from routes.qr import generate_qr_code_file
 
 router = APIRouter(prefix="/api/anpr", tags=["ANPR"])
 
-SAMPLE_IMAGES_DIR = BASE_DIR / "temp" / "Indian-Number-Plate-Recognition-master" / "inputs"
+SAMPLE_IMAGES_DIR = BASE_DIR.parent / "temp" / "Indian-Number-Plate-Recognition-master" / "inputs"
 
 # ─── Pydantic Schemas ───
 class FrameDetectRequest(BaseModel):
